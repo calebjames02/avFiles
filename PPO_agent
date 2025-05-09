@@ -1,0 +1,157 @@
+import gymnasium as gym
+import numpy as np
+import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+
+class DiscretizedCarRacing(gym.ActionWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.actions = [
+            np.array([0.0, 0.0, 0.0]),   # Coast
+            np.array([-0.8, 0.0, 0.0]),  # Hard left
+            np.array([0.8, 0.0, 0.0]),   # Hard right
+            np.array([-0.5, 0.3, 0.0]),  # Gentle left + gas
+            np.array([0.5, 0.3, 0.0]),   # Gentle right + gas
+            np.array([-0.5, 0.6, 0.0]),  # Harder left + gas
+            np.array([0.5, 0.6, 0.0]),   # Harder right + gas
+            np.array([0.0, 1.0, 0.0]),   # Full gas
+            np.array([0.0, 0.5, 0.0]),   # Half gas
+            np.array([0.0, 0.0, 0.8]),   # Brake
+            np.array([0.0, 0.0, 0.3]),   # Light brake
+        ]
+        self.action_space = gym.spaces.Discrete(len(self.actions))
+
+    def action(self, act):
+        return self.actions[act]
+
+# Create the environment
+env = gym.make("CarRacing-v3", render_mode="human")
+env = DiscretizedCarRacing(env)
+log_dir = f"runs/experiment_{int(time.time())}"
+writer = SummaryWriter(log_dir=log_dir)
+obs_shape = env.observation_space.shape  # (96, 96, 3)
+action_dim = env.action_space.n   # 3 (steering, gas, brake)
+
+class Policy(nn.Module):
+    def __init__(self, num_actions):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=8, stride=4),  # (96 -> 23)
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),  # (23 -> 10)
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),  # (10 -> 8)
+            nn.ReLU()
+        )
+
+        # Dynamically compute CNN output size
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 3, 96, 96)
+            conv_out = self.cnn(dummy_input)
+            conv_out_size = conv_out.view(1, -1).shape[1]
+
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(conv_out_size, 128),
+            nn.ReLU(),
+        )
+
+        self.policy_head = nn.Linear(128, num_actions)
+        self.value_head = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = x / 255.0  # Normalize image
+        x = self.cnn(x)
+        x = self.fc(x)
+        logits = self.policy_head(x)
+        value = self.value_head(x)
+        return logits, value
+
+
+policy = Policy(num_actions = env.action_space.n)
+optimizer = optim.Adam(policy.parameters(), lr=1e-4)
+
+gamma = 0.99
+eps_clip = 0.2
+ppo_epochs = 10
+epsilon = 0.2
+
+def compute_returns(rewards, dones, last_value, gamma):
+    returns = []
+    running_return = last_value
+    for reward, done in zip(reversed(rewards), reversed(dones)):
+        running_return = reward + gamma * running_return * (1.0 - done)
+        returns.insert(0, running_return)
+    return torch.tensor(returns, dtype=torch.float32, device=old_values.device)
+
+# Training loop
+for episode in range(250): # Number of tests to run
+    state, _ = env.reset()
+    done = False
+    total_reward = 0
+    states, actions, rewards, dones, log_probs, values = [], [], [], [], [], []
+
+    while not done:
+        # Preprocess state
+        state_t = torch.tensor(np.transpose(state, (2, 0, 1)), dtype=torch.float32).unsqueeze(0)
+
+        with torch.no_grad():
+            _, last_value = policy(torch.tensor(np.transpose(state, (2, 0, 1)), dtype=torch.float32).unsqueeze(0))
+            last_value = last_value.item()
+        
+            # Forward pass
+            logits, value = policy(state_t)
+            dist = torch.distributions.Categorical(logits=logits)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+
+        # Take action in environment
+        next_state, reward, terminated, truncated, _ = env.step(action.item())
+        total_reward += reward
+        done = terminated or truncated
+
+        state = next_state
+        
+        states.append(state_t.squeeze(0))
+        actions.append(action)
+        rewards.append(reward)
+        dones.append(done)
+        log_probs.append(log_prob)
+        values.append(value.detach().squeeze())
+                
+    states = torch.stack(states)
+    actions = torch.stack(actions)
+    old_log_probs = torch.stack(log_probs).detach()
+    old_values = torch.stack(values).detach()
+        
+    returns = compute_returns(rewards, dones, last_value, gamma)
+    advantages = returns - old_values
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    for _ in range(ppo_epochs):
+        logits, new_values = policy(states)
+        dist = torch.distributions.Categorical(logits=logits)
+        new_log_probs = dist.log_prob(actions)
+           
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        surr1 = advantages * ratio # First part of minimum statement from L_CLIP
+        surr2 = advantages * torch.clamp(ratio, 1 - epsilon, 1 + epsilon) # Second part of minimum statement from L_CLIP
+        policy_loss = -torch.min(surr1, surr2).mean() # To maximize expected reward, we minimize the expected loss (negative)
+            
+        value_loss = nn.functional.mse_loss(new_values.view(-1), returns)
+        loss = policy_loss + 10 * value_loss
+            
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+            
+        writer.add_scalar("Reward/Total", total_reward, episode)
+        writer.add_scalar("Loss/Policy", policy_loss.item(), episode)
+        writer.add_scalar("Loss/Value", value_loss.item(), episode)
+        writer.add_scalar("Action/Mean", action.float().mean().item(), episode)
+        writer.add_scalar("Action/Std", action.float().std().item(), episode)
+
+    print(f"Episode {episode}: Total Reward = {total_reward}")
